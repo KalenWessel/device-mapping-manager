@@ -70,82 +70,151 @@ func listenForMounts() {
 
 	defer cli.Close()
 
+	// Subscribe before scanning. A container that starts between the scan and the subscription
+	// would otherwise be missed by both, and would never receive its device rules.
 	msgs, errs := cli.Events(
 		ctx,
 		types.EventsOptions{Filters: filters.NewArgs(filters.Arg("event", "start"))},
 	)
+
+	// Keyed by container ID and pid, so a container restarted in place is treated as new work
+	// while the scan/event overlap is still deduplicated.
+	processed := make(map[string]bool)
+
+	scanRunningContainers(ctx, cli, processed)
 
 	for {
 		select {
 		case err := <-errs:
 			log.Fatal(err)
 		case msg := <-msgs:
-			info, err := cli.ContainerInspect(ctx, msg.Actor.ID)
+			processContainer(ctx, cli, msg.Actor.ID, processed)
+		}
+	}
+}
 
-			if err != nil {
-				panic(err)
-			} else {
-				pid := info.State.Pid
-				version, err := cgroup.GetDeviceCGroupVersion("/", pid)
+// scanRunningContainers applies device rules to containers that were already running when this
+// process started. Without it, anything started before this process never gets its rules, which
+// on Swarm means a container can run indefinitely unable to open its device.
+func scanRunningContainers(ctx context.Context, cli *client.Client, processed map[string]bool) {
+	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
 
-				log.Printf("The cgroup version for process %d is: %v\n", pid, version)
+	if err != nil {
+		log.Printf("unable to list running containers: %v\n", err)
+		return
+	}
 
+	log.Printf("Scanning %d running container(s) for device mounts\n", len(containers))
+
+	for _, container := range containers {
+		processContainer(ctx, cli, container.ID, processed)
+	}
+}
+
+func processContainer(ctx context.Context, cli *client.Client, containerId string, processed map[string]bool) {
+	info, err := cli.ContainerInspect(ctx, containerId)
+
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	pid := info.State.Pid
+
+	if pid == 0 {
+		log.Printf("%s has no running process... skipping\n", containerId)
+		return
+	}
+
+	key := fmt.Sprintf("%s:%d", containerId, pid)
+
+	if processed[key] {
+		return
+	}
+
+	processed[key] = true
+
+	// Privileged containers already have unrestricted device access, and rewriting their filter
+	// only bloats the eBPF program.
+	if info.HostConfig != nil && info.HostConfig.Privileged {
+		log.Printf("%s is privileged and already has device access... skipping\n", containerId)
+		return
+	}
+
+	version, err := cgroup.GetDeviceCGroupVersion("/", pid)
+
+	log.Printf("The cgroup version for process %d is: %v\n", pid, version)
+
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	log.Printf("Checking mounts for process %d\n", pid)
+
+	processMounts(containerId, info.Mounts, pid, version)
+}
+
+func processMounts(containerId string, mounts []types.MountPoint, pid int, version int) {
+	api, err := cgroup.New(version)
+
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	for _, mount := range mounts {
+		log.Printf(
+			"%s/%v requested a volume mount for %s at %s\n",
+			containerId, pid, mount.Source, mount.Destination,
+		)
+
+		if !strings.HasPrefix(mount.Source, "/dev") {
+			log.Printf("%s is not a device... skipping\n", mount.Source)
+			continue
+		}
+
+		// Walking the whole device tree would add a rule per node, granting far more than the
+		// mount implies and bloating the eBPF program. Containers that mount all of /dev are
+		// privileged in practice and do not need rules.
+		if path.Clean(mount.Source) == "/dev" {
+			log.Printf("%s is the entire device tree... skipping\n", mount.Source)
+			continue
+		}
+
+		cgroupPath, sysfsPath, err := api.GetDeviceCGroupMountPath("/", pid)
+
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		cgroupPath = path.Join(rootPath, sysfsPath, cgroupPath)
+
+		log.Printf("The cgroup path for process %d is at %v\n", pid, cgroupPath)
+
+		if fileInfo, err := os.Stat(mount.Source); err != nil {
+			log.Println(err)
+			continue
+		} else {
+			if fileInfo.IsDir() {
+				err := filepath.Walk(mount.Source,
+					func(path string, info os.FileInfo, err error) error {
+						if err != nil {
+							return err
+						} else if info.IsDir() {
+							return nil
+						} else if err = applyDeviceRules(api, path, cgroupPath, pid); err != nil {
+							log.Println(err)
+						}
+						return nil
+					})
 				if err != nil {
 					log.Println(err)
-					break
 				}
-
-				log.Printf("Checking mounts for process %d\n", pid)
-
-				for _, mount := range info.Mounts {
-					log.Printf(
-						"%s/%v requested a volume mount for %s at %s\n",
-						msg.Actor.ID, info.State.Pid, mount.Source, mount.Destination,
-					)
-
-					if !strings.HasPrefix(mount.Source, "/dev") {
-						log.Printf("%s is not a device... skipping\n", mount.Source)
-						continue
-					}
-
-					api, err := cgroup.New(version)
-					cgroupPath, sysfsPath, err := api.GetDeviceCGroupMountPath("/", pid)
-
-					if err != nil {
-						log.Println(err)
-						break
-					}
-
-					cgroupPath = path.Join(rootPath, sysfsPath, cgroupPath)
-
-					log.Printf("The cgroup path for process %d is at %v\n", pid, cgroupPath)
-
-					if fileInfo, err := os.Stat(mount.Source); err != nil {
-						log.Println(err)
-						continue
-					} else {
-						if fileInfo.IsDir() {
-							err := filepath.Walk(mount.Source,
-								func(path string, info os.FileInfo, err error) error {
-									if err != nil {
-										return err
-									} else if info.IsDir() {
-										return nil
-									} else if err = applyDeviceRules(api, path, cgroupPath, pid); err != nil {
-										log.Println(err)
-									}
-									return nil
-								})
-							if err != nil {
-								log.Println(err)
-							}
-						} else {
-							if err = applyDeviceRules(api, mount.Source, cgroupPath, pid); err != nil {
-								log.Println(err)
-							}
-						}
-					}
-
+			} else {
+				if err = applyDeviceRules(api, mount.Source, cgroupPath, pid); err != nil {
+					log.Println(err)
 				}
 			}
 		}
